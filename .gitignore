@@ -1,10 +1,11 @@
-# Python
+venv/
 __pycache__/
 *.pyc
+*.png
 
-# Virtual environments
-venv/
 
+dist/
+build/
 # Output files
 *.png
 EOF
