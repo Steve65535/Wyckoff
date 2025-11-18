@@ -15,7 +15,7 @@ limit = 300  # 每页拉取多少根K线（OKX上限通常为300）
 start_time = "2025-06-10T00:00:00Z"  # 你想从哪个时间点开始
 price_scale_thousand = True  # True 时以“千”为单位显示（105000 显示为 105）
 # 点数图参数
-box_size = 1.0  # 格值（与显示单位一致：当 price_scale_thousand=True 时，单位为“千USD”；1.0即1000 USD；可改为0.5）
+box_size = 0.5  # 格值（与显示单位一致：当 price_scale_thousand=True 时，单位为“千USD”；1.0即1000 USD；可改为0.5）
 reversal_boxes = 2  # 转向格（2格更敏感，列更多）
 # 分图参数：每张图最多多少列
 columns_per_image = 80
@@ -220,21 +220,22 @@ def _floor_to_box(value, box):
 
 def build_point_and_figure(prices, box_size, reversal_boxes, timestamps=None, highs=None, lows=None):
     """
-    根据价格序列生成点数图列数据；若提供 highs/lows，则用每根K的高低价进行“柱内延伸/反转”，列数会更多。
-    返回 columns: [ { 'type': 'X'|'O', 'boxes': [level1, level2, ...], 'start_ts': pd.Timestamp|None }, ... ]
-    其中 level 按价格从下到上或上到下逐格记录。
+    严格版 Wyckoff N 点图（Point & Figure）
+    - 一次反转必须超过 reversal_boxes * box_size 才成立
+    - 避免出现“两格短列”或“虚反转列”
+    - 支持高低价逻辑
     """
     columns = []
     if len(prices) == 0:
         return columns
 
-    # 以首价落到格子上为起点
-    first = float(prices[0])
-    current_level = _floor_to_box(first, box_size)
-    current_col = None  # {'type': 'X'|'O', 'boxes': [levels...], 'top': float, 'bottom': float}
+    # 初始化方向
+    first_price = float(prices[0])
+    current_box = (first_price // box_size) * box_size
+    direction = None  # 尚未确定方向
 
-    def start_column(col_type, start_level, end_level, start_idx=None):
-        # 生成从 start 到 end 的格子（包含端点），方向取决于 col_type
+    def new_column(col_type, start_level, end_level, idx):
+        """生成列"""
         boxes = []
         if col_type == 'X':
             lvl = start_level
@@ -246,70 +247,70 @@ def build_point_and_figure(prices, box_size, reversal_boxes, timestamps=None, hi
             while lvl >= end_level:
                 boxes.append(lvl)
                 lvl -= box_size
-        col = {
+        return {
             'type': col_type,
             'boxes': boxes,
-            'start_ts': timestamps[start_idx] if (timestamps is not None and start_idx is not None) else None
+            'start_ts': timestamps.iloc[idx] if timestamps is not None else None
         }
-        return col
 
-    # 确定初始方向：直到出现至少1格的突破才建第一列
+    # ---------------- 初始列 ----------------
     i = 1
-    while i < len(prices) and current_col is None:
+    while i < len(prices) and direction is None:
         px = float(prices[i])
-        up_break = px >= current_level + box_size
-        down_break = px <= current_level - box_size
-        if up_break:
-            # 新建 X 列，从 current_level 到 达到的最高格
-            top_level = _floor_to_box(px, box_size)
-            current_col = start_column('X', current_level + box_size, top_level, start_idx=i)
-        elif down_break:
-            bottom_level = _floor_to_box(px, box_size)
-            current_col = start_column('O', current_level - box_size, bottom_level, start_idx=i)
+        if px >= current_box + box_size:
+            direction = 'X'
+            col = new_column('X', current_box + box_size, (px // box_size) * box_size, i)
+            columns.append(col)
+        elif px <= current_box - box_size:
+            direction = 'O'
+            col = new_column('O', current_box - box_size, (px // box_size) * box_size, i)
+            columns.append(col)
         i += 1
-
-    if current_col is None:
-        # 未形成任何列（价格未越过一个格），返回空
+    if direction is None:
+        print("⚠️ 无法形成首列，波动不足。")
         return columns
 
-    columns.append(current_col)
-
-    # 后续价格推进/反转逻辑（如有 highs/lows 则优先用其进行更充分的箱体填充）
+    # ---------------- 主循环 ----------------
     for j in range(i, len(prices)):
-        px = float(prices[j])
-        hi = float(highs[j]) if highs is not None else px
-        lo = float(lows[j]) if lows is not None else px
-        col_type = columns[-1]['type']
-        boxes = columns[-1]['boxes']
+        hi = float(highs[j]) if highs is not None else float(prices[j])
+        lo = float(lows[j]) if lows is not None else float(prices[j])
+        last_col = columns[-1]
+        col_type = last_col['type']
+        boxes = last_col['boxes']
+        top = max(boxes)
+        bottom = min(boxes)
+
         if col_type == 'X':
-            current_top = boxes[-1]
-            # 先用当根最高价进行“向上延伸”
-            while hi >= current_top + box_size:
-                current_top += box_size
-                boxes.append(current_top)
-            # 使用当根最低价判定反转
-            reversal_level = current_top - reversal_boxes * box_size
-            if lo <= reversal_level:
-                # 新 O 列，从 current_top - box_size 开始向下，直到 low 所在格
-                new_bottom = _floor_to_box(lo, box_size)
-                start_from = current_top - box_size
-                columns.append(start_column('O', start_from, new_bottom, start_idx=j))
+            # 向上延伸
+            while hi >= top + box_size:
+                top += box_size
+                boxes.append(top)
+            # 检查反转（仅当下破 ≥ n 个格）
+            reversal_price = top - reversal_boxes * box_size
+            if lo <= reversal_price:
+                new_bottom = (lo // box_size) * box_size
+                # 确保反转列至少有 n 个格
+                if top - new_bottom >= reversal_boxes * box_size:
+                    new_col = new_column('O', top - box_size, new_bottom, j)
+                    columns.append(new_col)
         else:
-            current_bottom = boxes[-1]
-            # 先用当根最低价进行“向下延伸”
-            while lo <= current_bottom - box_size:
-                current_bottom -= box_size
-                boxes.append(current_bottom)
-            # 使用当根最高价判定反转
-            reversal_level = current_bottom + reversal_boxes * box_size
-            if hi >= reversal_level:
-                # 新 X 列，从 current_bottom + box_size 开始向上，直到 high 所在格
-                new_top = _floor_to_box(hi, box_size)
-                start_from = current_bottom + box_size
-                columns.append(start_column('X', start_from, new_top, start_idx=j))
+            # 向下延伸
+            while lo <= bottom - box_size:
+                bottom -= box_size
+                boxes.append(bottom)
+            # 检查反转（仅当上破 ≥ n 个格）
+            reversal_price = bottom + reversal_boxes * box_size
+            if hi >= reversal_price:
+                new_top = (hi // box_size) * box_size
+                if new_top - bottom >= reversal_boxes * box_size:
+                    new_col = new_column('X', bottom + box_size, new_top, j)
+                    columns.append(new_col)
 
+        if j % 1000 == 0:
+            print(f"⏳ 进度 {j}/{len(prices)} 根K线")
+
+    print(f"✅ n点图构建完成，共 {len(columns)} 列。")
     return columns
-
 def plot_point_and_figure(columns, unit_label="千USD", tz_display="Asia/Shanghai", filename="wyckoff_pnf.png", title_suffix=None):
     """
     使用 matplotlib 原生绘制点数图（X/O），横轴为列序号，纵轴为价格格子。
@@ -357,23 +358,28 @@ def plot_point_and_figure(columns, unit_label="千USD", tz_display="Asia/Shangha
 
 def plot_point_and_figure_paged(columns, unit_label="千USD", tz_display="Asia/Shanghai", columns_per_image=80):
     """
-    将列按固定数量分页绘制，多张图片；每张图片标题包含该页起始列的时间（若可用）。
+    分页绘制点数图，修复文件名重复和部分页空白的Bug。
     """
     if not columns:
         print("⚠️ 无列可绘制。")
         return
+
     total = len(columns)
     pages = (total + columns_per_image - 1) // columns_per_image
+    print(f"🖼️ 共 {total} 列，将绘制 {pages} 页。")
+
     for p in range(pages):
         start = p * columns_per_image
         end = min((p + 1) * columns_per_image, total)
         chunk = columns[start:end]
-        # 起始时间（若记录），用于标题和文件名
+
+        # 起始时间（若存在）
         start_ts = None
         for c in chunk:
             if c.get('start_ts') is not None:
                 start_ts = c['start_ts']
                 break
+
         if start_ts is not None:
             t_disp = start_ts.tz_convert(tz_display)
             stamp = t_disp.strftime("%Y%m%d-%H%M")
@@ -382,17 +388,37 @@ def plot_point_and_figure_paged(columns, unit_label="千USD", tz_display="Asia/S
         else:
             title_suffix = f"第 {p+1}/{pages} 页"
             fname = f"wyckoff_pnf_{p+1:02d}.png"
+
+        print(f"🧩 正在绘制第 {p+1}/{pages} 页: {fname}")
         plot_point_and_figure(chunk, unit_label=unit_label, tz_display=tz_display, filename=fname, title_suffix=title_suffix)
 
+def filter_small_columns(columns, box_size, min_boxes=3):
+    """
+    过滤掉高度（格数）小于 min_boxes 的列。
+    即：抽掉小于 n 行的列。
+    """
+    if not columns:
+        return []
+
+    filtered = []
+    for col in columns:
+        height = (max(col["boxes"]) - min(col["boxes"])) / box_size
+        if height >= min_boxes:
+            filtered.append(col)
+    print(f"🧹 已过滤短列：原 {len(columns)} → 保留 {len(filtered)} 列 (最少 {min_boxes} 格)")
+    return filtered
+# ========== 主程序 ==========
 # ========== 主程序 ==========
 if __name__ == "__main__":
     print(f"获取 {symbol} {bar} 数据中...")
     df = fetch_ohlcv(symbol, bar, start_time)
+
     # 价格序列（收盘），按“千”为单位（若开启）
     close_prices = df["close"].astype(float).values
     high_prices = df["high"].astype(float).values
     low_prices = df["low"].astype(float).values
     ts_series = df["timestamp"]
+
     if price_scale_thousand:
         close_prices = close_prices / 1000.0
         high_prices = high_prices / 1000.0
@@ -401,16 +427,41 @@ if __name__ == "__main__":
     else:
         unit = "USD"
 
-    # 生成点数图列并绘制
+    print("🧩 开始构建单点数图...")
     pnf_columns = build_point_and_figure(
         close_prices,
         box_size=box_size,
-        reversal_boxes=reversal_boxes,
+        reversal_boxes=1,  # 先生成单点数图
         timestamps=ts_series,
         highs=high_prices,
         lows=low_prices,
     )
-    if len(pnf_columns) > columns_per_image:
+
+    # ============================
+    # 过滤掉小于 n 行的列
+    # ============================
+    def filter_small_columns(columns, box_size, min_boxes=3):
+        """过滤掉高度小于 min_boxes 的列"""
+        if not columns:
+            return []
+        filtered = []
+        for col in columns:
+            height = (max(col["boxes"]) - min(col["boxes"])) / box_size
+            if height >= min_boxes:
+                filtered.append(col)
+        print(f"🧹 已过滤短列：原 {len(columns)} → 保留 {len(filtered)} 列 (最少 {min_boxes} 格)")
+        return filtered
+
+    pnf_columns = filter_small_columns(pnf_columns, box_size, min_boxes=reversal_boxes)
+
+    # ============================
+    # 绘图部分
+    # ============================
+    if len(pnf_columns) == 0:
+        print("⚠️ 没有列可绘制，检查 box_size 或 reversal_boxes 是否过大。")
+    elif len(pnf_columns) > columns_per_image:
         plot_point_and_figure_paged(pnf_columns, unit_label=unit, columns_per_image=columns_per_image)
     else:
         plot_point_and_figure(pnf_columns, unit_label=unit)
+
+    print("✅ 全部完成。")
